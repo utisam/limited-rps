@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 
-	"github.com/tendermint/tendermint/abci/example/code"
 	"github.com/tendermint/tendermint/abci/types"
 	cmn "github.com/tendermint/tendermint/libs/common"
 	dbm "github.com/tendermint/tendermint/libs/db"
@@ -44,8 +43,46 @@ func saveState(state State) {
 	state.db.Set(stateKey, stateBytes)
 }
 
-func prefixKey(key []byte) []byte {
+func memberPrefixKey(key []byte) []byte {
 	return append(lrpsMemberPrefixKey, key...)
+}
+
+type MemberState struct {
+	Cards map[string]int64 `json:"hands"`
+	Stars int64            `json:"stars"`
+}
+
+func NewMemberStateFromBytes(b []byte) *MemberState {
+	var state MemberState
+	if len(b) != 0 {
+		err := json.Unmarshal(b, &state)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return &state
+}
+
+func (s *MemberState) Leave() bool {
+	if s.Stars == 0 {
+		return true
+	} else if s.Stars <= 2 {
+		for _, n := range s.Cards {
+			if n != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func (s *MemberState) Bytes() []byte {
+	res, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return res
 }
 
 type LRPSApplication struct {
@@ -65,26 +102,96 @@ func (app *LRPSApplication) SetOption(req types.RequestSetOption) types.Response
 	return types.ResponseSetOption{}
 }
 
+var (
+	initTxPrefix = []byte("init:")
+	playTxPrefix = []byte("play:")
+)
+
 func (app *LRPSApplication) DeliverTx(tx []byte) types.ResponseDeliverTx {
-	var key, value []byte
-	parts := bytes.Split(tx, []byte("="))
-	if len(parts) == 2 {
-		key, value = parts[0], parts[1]
-	} else {
-		key, value = tx, tx
-	}
-	app.state.db.Set(prefixKey(key), value)
-	app.state.Size += 1
+	if bytes.HasPrefix(tx, initTxPrefix) {
+		members := bytes.Split(tx[len(initTxPrefix):], []byte(","))
 
-	tags := []cmn.KVPair{
-		{Key: []byte("app.key"), Value: key},
-	}
-	return types.ResponseDeliverTx{Code: code.CodeTypeOK, Tags: tags}
+		for _, m := range members {
+			app.state.db.Set(memberPrefixKey(m), (&MemberState{
+				Cards: map[string]int64{
+					"rock":    4,
+					"paper":   4,
+					"scissor": 4,
+				},
+				Stars: 3,
+			}).Bytes())
+		}
+		app.state.Size = int64(len(members))
+	} else if bytes.HasPrefix(tx, playTxPrefix) {
+		prefixIDTx := bytes.SplitN(tx[len(playTxPrefix):], []byte(":"), 2)
+		id := prefixIDTx[0]
 
+		nameHandPairBytes := bytes.SplitN(prefixIDTx[1], []byte(","), 2)
+
+		names := make([][]byte, 2)
+		hands := make([]Hand, 2)
+		states := make([]*MemberState, 2)
+		for i, nameHandBytes := range nameHandPairBytes {
+			name, hand, err := parseNameHand(nameHandBytes)
+			if err != nil {
+				return types.ResponseDeliverTx{Code: CodeFormatError}
+			}
+
+			stateBytes := app.state.db.Get(memberPrefixKey(name))
+			if stateBytes == nil {
+				return types.ResponseDeliverTx{Code: CodeMemberNotFoundError}
+			}
+			state := NewMemberStateFromBytes(stateBytes)
+
+			if state.Cards[hand.String()] == 0 {
+				return types.ResponseDeliverTx{Code: CodeNoCardError}
+			}
+
+			names[i] = name
+			hands[i] = hand
+			states[i] = state
+		}
+
+		for i, s := range states {
+			s.Cards[hands[i].String()]--
+		}
+		result := CompareHands(hands[0], hands[1])
+		var winner []byte
+		if result > 0 {
+			states[0].Stars++
+			states[1].Stars--
+			winner = names[0]
+		} else if result < 0 {
+			states[0].Stars--
+			states[1].Stars++
+			winner = names[1]
+		}
+		for i, s := range states {
+			if s.Leave() {
+				app.state.db.Delete(memberPrefixKey(names[i]))
+			} else {
+				app.state.db.Set(memberPrefixKey(names[i]), states[i].Bytes())
+			}
+		}
+		tags := []cmn.KVPair{
+			{Key: []byte("app.id"), Value: id},
+			{Key: []byte("app.winner"), Value: winner},
+		}
+		return types.ResponseDeliverTx{Code: CodeTypeOK, Tags: tags}
+	}
+	return types.ResponseDeliverTx{Code: CodeFormatError}
+}
+
+func parseNameHand(nameHandBytes []byte) ([]byte, Hand, error) {
+	nameHand := bytes.SplitN(nameHandBytes, []byte("="), 2)
+	name, handBytes := nameHand[0], nameHand[1]
+
+	hand, err := ParseHand(string(handBytes))
+	return name, hand, err
 }
 
 func (app *LRPSApplication) CheckTx(tx []byte) types.ResponseCheckTx {
-	return types.ResponseCheckTx{Code: code.CodeTypeOK, GasWanted: 1}
+	return types.ResponseCheckTx{Code: CodeTypeOK, GasWanted: 1}
 }
 
 func (app *LRPSApplication) Commit() types.ResponseCommit {
@@ -100,7 +207,7 @@ func (app *LRPSApplication) Commit() types.ResponseCommit {
 
 func (app *LRPSApplication) Query(req types.RequestQuery) (res types.ResponseQuery) {
 	if req.Prove {
-		value := app.state.db.Get(prefixKey(req.Data))
+		value := app.state.db.Get(memberPrefixKey(req.Data))
 		res.Index = -1 // TODO make Proof return index
 		res.Key = req.Data
 		res.Value = value
@@ -111,7 +218,7 @@ func (app *LRPSApplication) Query(req types.RequestQuery) (res types.ResponseQue
 		}
 		return
 	} else {
-		value := app.state.db.Get(prefixKey(req.Data))
+		value := app.state.db.Get(memberPrefixKey(req.Data))
 		res.Value = value
 		if value != nil {
 			res.Log = "exists"
